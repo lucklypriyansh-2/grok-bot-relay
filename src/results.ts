@@ -1,7 +1,14 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import { RelayError, safeResultsNetworkError } from "./errors.js";
+import { parseArtifactList } from "./artifacts.js";
+import {
+  RelayError,
+  isRetryableHttpStatus,
+  safeResultsNetworkError,
+  transientHttpError,
+} from "./errors.js";
+import { withRetry } from "./retry.js";
 import { assertValidRequestId } from "./ids.js";
 import { RESULT_STATUSES, type GrokResult, type ResultStatus } from "./types.js";
 
@@ -51,7 +58,11 @@ export function parseResult(data: unknown): GrokResult {
   if (typeof finished_at !== "string" || !finished_at) {
     throw new RelayError("Result is missing finished_at.", "bad_result");
   }
-  return { request_id, status: status as ResultStatus, answer, finished_at };
+  const result: GrokResult = { request_id, status: status as ResultStatus, answer, finished_at };
+  if (rec.artifacts !== undefined) {
+    result.artifacts = parseArtifactList(rec.artifacts);
+  }
+  return result;
 }
 
 export class FileResultStore implements ResultStore {
@@ -93,63 +104,89 @@ export class FileResultStore implements ResultStore {
 
 /**
  * Reads and writes results over HTTP, for when the CLI and the bot no
- * longer share a filesystem (e.g. a tailnet host).
+ * longer share a filesystem (e.g. a tailnet host or a Cloudflare tunnel).
  *
  *   GET  {baseUrl}/results/{request_id}  -> 200 JSON or 404
  *   PUT  {baseUrl}/results/{request_id}  -> 200/201/204
  */
 export class HttpResultStore implements ResultStore {
-  constructor(
-    private readonly baseUrl: string,
-    private readonly headers: Record<string, string> = {},
-  ) {}
+  private readonly resolveBaseUrl: () => Promise<string>;
 
-  private urlFor(requestId: string): string {
+  constructor(
+    baseUrl: string | (() => Promise<string>),
+    private readonly headers: Record<string, string> = {},
+  ) {
+    this.resolveBaseUrl =
+      typeof baseUrl === "function" ? baseUrl : async () => baseUrl;
+  }
+
+  private async urlFor(requestId: string): Promise<string> {
     assertValidRequestId(requestId);
-    const base = this.baseUrl.replace(/\/+$/, "");
+    const base = (await this.resolveBaseUrl()).replace(/\/+$/, "");
     return `${base}/results/${encodeURIComponent(requestId)}`;
   }
 
   async read(requestId: string): Promise<GrokResult | null> {
-    let res: Response;
-    try {
-      res = await fetch(this.urlFor(requestId), {
-        method: "GET",
-        headers: { Accept: "application/json", ...this.headers },
-      });
-    } catch {
-      throw safeResultsNetworkError();
-    }
-    if (res.status === 404) return null;
-    if (!res.ok) {
+    return withRetry(async () => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 30_000);
+      let res: Response;
+      try {
+        res = await fetch(await this.urlFor(requestId), {
+          method: "GET",
+          headers: { Accept: "application/json", ...this.headers },
+          signal: ac.signal,
+        });
+      } catch {
+        throw safeResultsNetworkError();
+      } finally {
+        clearTimeout(timer);
+      }
+      if (res.status === 404) return null;
+      if (res.ok) {
+        try {
+          return parseResult(await res.json());
+        } catch (err) {
+          if (err instanceof RelayError) throw err;
+          throw new RelayError("Result is not valid JSON.", "bad_result");
+        }
+      }
+      await res.arrayBuffer().catch(() => undefined);
+      if (isRetryableHttpStatus(res.status)) {
+        throw transientHttpError("results", res.status);
+      }
       throw new RelayError(`Failed to read result (HTTP ${res.status}).`, "result_http_error");
-    }
-    try {
-      return parseResult(await res.json());
-    } catch (err) {
-      if (err instanceof RelayError) throw err;
-      throw new RelayError("Result is not valid JSON.", "bad_result");
-    }
+    });
   }
 
   async writeAtomic(result: GrokResult): Promise<void> {
-    let res: Response;
-    try {
-      res = await fetch(this.urlFor(result.request_id), {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          ...this.headers,
-        },
-        body: JSON.stringify(result),
-      });
-    } catch {
-      throw safeResultsNetworkError();
-    }
-    if (!res.ok) {
+    await withRetry(async () => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), 30_000);
+      let res: Response;
+      try {
+        res = await fetch(await this.urlFor(result.request_id), {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+            ...this.headers,
+          },
+          body: JSON.stringify(result),
+          signal: ac.signal,
+        });
+      } catch {
+        throw safeResultsNetworkError();
+      } finally {
+        clearTimeout(timer);
+      }
+      if (res.ok) return;
+      await res.arrayBuffer().catch(() => undefined);
+      if (isRetryableHttpStatus(res.status)) {
+        throw transientHttpError("results", res.status);
+      }
       throw new RelayError(`Failed to write result (HTTP ${res.status}).`, "result_http_error");
-    }
+    });
   }
 }
 
@@ -157,13 +194,15 @@ export function createResultStore(options: {
   resultsDir: string;
   resultsUrl?: string;
   resultsToken?: string;
+  getResultsUrl?: () => Promise<string>;
 }): ResultStore {
-  if (options.resultsUrl) {
+  if (options.getResultsUrl || options.resultsUrl) {
     const headers: Record<string, string> = {};
     if (options.resultsToken) {
       headers.Authorization = `Bearer ${options.resultsToken}`;
     }
-    return new HttpResultStore(options.resultsUrl, headers);
+    const resolve = options.getResultsUrl ?? (async () => options.resultsUrl as string);
+    return new HttpResultStore(resolve, headers);
   }
   return new FileResultStore(options.resultsDir);
 }

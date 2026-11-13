@@ -1,6 +1,6 @@
 {
   "name": "grok-bot-relay",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Tiny MCP server and CLI that sends a task to a Grok Bot routine webhook and collects the answer.",
   "type": "module",
   "main": "dist/server.js",
@@ -18,7 +18,9 @@
     "serve-results": "node dist/results-server.js",
     "test": "tsc && tsx --test --test-timeout=60000 tests/*.test.ts",
     "live-test": "bash scripts/live-test.sh",
-    "start-tunnel": "bash scripts/start-results-tunnel.sh"
+    "start-tunnel": "bash scripts/start-results-tunnel.sh",
+    "watchdog": "python3 scripts/tunnel-watchdog.py",
+    "start-watchdog": "bash scripts/run-watchdog.sh"
   },
   "keywords": [
     "mcp",

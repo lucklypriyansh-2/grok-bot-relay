@@ -2,6 +2,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import {
+  createArtifactStore,
+  downloadArtifacts,
+  withArtifacts,
+} from "./artifacts.js";
+import { loadConfig } from "./config.js";
 import { RelayError } from "./errors.js";
 import {
   askGrok,
@@ -14,7 +20,7 @@ import {
 
 const server = new McpServer({
   name: "grok-bot-relay",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 function toolText(payload: unknown, isError = false) {
@@ -34,6 +40,16 @@ function toolError(err: unknown) {
 
 function deps() {
   return createRelay(process.env);
+}
+
+function artifactStore() {
+  const config = loadConfig(process.env);
+  return createArtifactStore({
+    resultsDir: config.resultsDir,
+    resultsUrl: config.resultsUrl,
+    resultsToken: config.resultsToken,
+    getResultsUrl: config.getResultsUrl,
+  });
 }
 
 server.registerTool(
@@ -69,7 +85,7 @@ server.registerTool(
         { task, context, bot, waitSeconds: wait_seconds },
         deps(),
       );
-      return toolText(outcome);
+      return toolText(await withArtifacts(outcome, artifactStore()));
     } catch (err) {
       return toolError(err);
     }
@@ -109,7 +125,7 @@ server.registerTool(
   {
     title: "Get Grok Bot result",
     description:
-      "Look up a previously submitted task by request_id. Returns the result, or status pending if it is not ready yet.",
+      "Look up a previously submitted task by request_id. Returns the result, or status pending if it is not ready yet. A finished result may include an `artifacts` array (detailed files such as Markdown reports, JSON, CSV or XLSX). The `answer` is only a summary: when artifacts are listed, call download_grok_artifacts and read the files for the full detail.",
     inputSchema: {
       request_id: z
         .string()
@@ -120,7 +136,58 @@ server.registerTool(
   async ({ request_id }) => {
     try {
       const outcome = await getGrokResult(request_id, deps());
-      return toolText(outcome);
+      return toolText(await withArtifacts(outcome, artifactStore()));
+    } catch (err) {
+      return toolError(err);
+    }
+  },
+);
+
+server.registerTool(
+  "list_grok_artifacts",
+  {
+    title: "List Grok Bot artifacts",
+    description:
+      "List the artifact files Grok Bot attached to a request (name, size in bytes, sha256, content type). Artifacts hold the full detail: reports, source lists, JSON, CSV, XLSX.",
+    inputSchema: {
+      request_id: z.string().min(1).describe("The request_id of the task."),
+    },
+  },
+  async ({ request_id }) => {
+    try {
+      const artifacts = await artifactStore().list(request_id);
+      return toolText({ request_id, artifacts });
+    } catch (err) {
+      return toolError(err);
+    }
+  },
+);
+
+server.registerTool(
+  "download_grok_artifacts",
+  {
+    title: "Download Grok Bot artifacts",
+    description:
+      "Download a request's artifact files to a local folder (default ~/grok-relay-artifacts/<request_id>/), verifying each sha256. Returns the local paths so you can Read them. Optionally pass names to fetch only some files.",
+    inputSchema: {
+      request_id: z.string().min(1).describe("The request_id of the task."),
+      dest_dir: z
+        .string()
+        .optional()
+        .describe("Local folder to save into. Default ~/grok-relay-artifacts/<request_id>/."),
+      names: z
+        .array(z.string().min(1))
+        .optional()
+        .describe("Only download these artifact names. Default: all."),
+    },
+  },
+  async ({ request_id, dest_dir, names }) => {
+    try {
+      const out = await downloadArtifacts(artifactStore(), request_id, {
+        destDir: dest_dir,
+        names,
+      });
+      return toolText(out);
     } catch (err) {
       return toolError(err);
     }

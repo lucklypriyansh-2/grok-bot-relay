@@ -8,6 +8,7 @@ import { RelayError } from "../src/errors.ts";
 import { loadConfig } from "../src/config.ts";
 import { generateRequestId } from "../src/ids.ts";
 import { FileResultStore, HttpResultStore, createResultStore } from "../src/results.ts";
+import { FileTaskStore, HttpTaskStore, MAX_TASK_BYTES, createTaskStore } from "../src/tasks.ts";
 import {
   ensureResultsToken,
   parseEnvFile,
@@ -79,6 +80,7 @@ describe("results HTTP server", () => {
       });
       const server = await startResultsServer({
         resultsDir: dir,
+        tasksDir: path.join(dir, "tasks"),
         token: TOKEN,
         host: "127.0.0.1",
         port: 0,
@@ -140,6 +142,107 @@ describe("results HTTP server", () => {
       }
     });
   });
+
+  it("creates a task via PUT /tasks, rejects overwrite, GET, bad ids, and oversize bodies", async () => {
+    await withTempDir(async (dir) => {
+      const tasksDir = path.join(dir, "tasks");
+      const server = await startResultsServer({
+        resultsDir: dir,
+        tasksDir,
+        token: TOKEN,
+        host: "127.0.0.1",
+        port: 0,
+      });
+      try {
+        const request_id = "gb-20261113-140000-taskput01";
+        const payload = {
+          task: "do the work",
+          context: "background",
+          bot: "Coding Bot",
+        };
+        const created = await request(`${server.url}/tasks/${request_id}`, {
+          method: "PUT",
+          token: TOKEN,
+          body: JSON.stringify(payload),
+        });
+        assert.equal(created.status, 201);
+
+        const stored = JSON.parse(await readFile(path.join(tasksDir, `${request_id}.json`), "utf8"));
+        assert.equal(stored.task, "do the work");
+        assert.equal(stored.context, "background");
+        assert.equal(stored.bot, "Coding Bot");
+
+        const same = await request(`${server.url}/tasks/${request_id}`, {
+          method: "PUT",
+          token: TOKEN,
+          body: JSON.stringify(payload),
+        });
+        assert.equal(same.status, 200);
+
+        const again = await request(`${server.url}/tasks/${request_id}`, {
+          method: "PUT",
+          token: TOKEN,
+          body: JSON.stringify({ task: "should not overwrite" }),
+        });
+        assert.equal(again.status, 409);
+        const reread = JSON.parse(await readFile(path.join(tasksDir, `${request_id}.json`), "utf8"));
+        assert.equal(reread.task, "do the work");
+
+        const noToken = await request(`${server.url}/tasks/${request_id}-b`, {
+          method: "PUT",
+          body: JSON.stringify({ task: "nope" }),
+        });
+        assert.equal(noToken.status, 401);
+
+        const badToken = await request(`${server.url}/tasks/${request_id}-c`, {
+          method: "PUT",
+          token: OTHER,
+          body: JSON.stringify({ task: "nope" }),
+        });
+        assert.equal(badToken.status, 401);
+
+        const got = await request(`${server.url}/tasks/${request_id}`, { token: TOKEN });
+        assert.equal(got.status, 404);
+
+        const invalid = await request(`${server.url}/tasks/../etc/passwd`, {
+          method: "PUT",
+          token: TOKEN,
+          body: JSON.stringify({ task: "nope" }),
+        });
+        assert.ok(invalid.status === 400 || invalid.status === 404);
+
+        const dotted = await request(`${server.url}/tasks/foo.bar`, {
+          method: "PUT",
+          token: TOKEN,
+          body: JSON.stringify({ task: "nope" }),
+        });
+        assert.equal(dotted.status, 400);
+
+        const empty = await request(`${server.url}/tasks/${request_id}-empty`, {
+          method: "PUT",
+          token: TOKEN,
+          body: JSON.stringify({ task: "   " }),
+        });
+        assert.equal(empty.status, 400);
+
+        const badJson = await request(`${server.url}/tasks/${request_id}-json`, {
+          method: "PUT",
+          token: TOKEN,
+          body: "not-json",
+        });
+        assert.equal(badJson.status, 400);
+
+        const oversized = await request(`${server.url}/tasks/${request_id}-big`, {
+          method: "PUT",
+          token: TOKEN,
+          body: JSON.stringify({ task: "z".repeat(MAX_TASK_BYTES + 1) }),
+        });
+        assert.equal(oversized.status, 413);
+      } finally {
+        await server.close();
+      }
+    });
+  });
 });
 
 describe("HttpResultStore", () => {
@@ -155,6 +258,7 @@ describe("HttpResultStore", () => {
       });
       const server = await startResultsServer({
         resultsDir: dir,
+        tasksDir: path.join(dir, "tasks"),
         token: TOKEN,
         host: "127.0.0.1",
         port: 0,
@@ -206,24 +310,97 @@ describe("HttpResultStore", () => {
   });
 });
 
-describe("config for HTTP results", () => {
-  it("requires GROK_RELAY_RESULTS_TOKEN when a results URL is set", () => {
-    let thrown: unknown;
-    try {
-      loadConfig({
-        GROK_WEBHOOK_URL: "http://example.invalid",
-        GROK_WEBHOOK_KEY: "TESTKEY_DO_NOT_PRINT_9f3a2c1b",
-        GROK_RELAY_RESULTS_URL: "http://example.invalid/results-base",
+describe("HttpTaskStore", () => {
+  it("uploads a task over HTTP with the bearer token and fails clearly on errors", async () => {
+    await withTempDir(async (dir) => {
+      const tasksDir = path.join(dir, "tasks");
+      const server = await startResultsServer({
+        resultsDir: dir,
+        tasksDir,
+        token: TOKEN,
+        host: "127.0.0.1",
+        port: 0,
       });
-    } catch (err) {
-      thrown = err;
-    }
-    assert.ok(thrown instanceof RelayError);
-    assert.equal(
-      thrown.message,
-      "Missing required environment variable: GROK_RELAY_RESULTS_TOKEN.",
+      try {
+        const request_id = "gb-20261113-140000-httpput01";
+        const store = createTaskStore({
+          tasksDir,
+          resultsUrl: server.url,
+          resultsToken: TOKEN,
+        });
+        assert.ok(store instanceof HttpTaskStore);
+        await store.put(request_id, { task: "via-http", context: "c" });
+        const stored = JSON.parse(await readFile(path.join(tasksDir, `${request_id}.json`), "utf8"));
+        assert.equal(stored.task, "via-http");
+        assert.equal(stored.context, "c");
+        await store.put(request_id, { task: "via-http", context: "c" });
+
+        await assert.rejects(
+          () => store.put(request_id, { task: "again" }),
+          (err: unknown) => {
+            assert.ok(err instanceof RelayError);
+            assert.equal((err as RelayError).code, "task_exists");
+            assertNoSecret(err.message);
+            return true;
+          },
+        );
+
+        const unauth = new HttpTaskStore(server.url);
+        await assert.rejects(
+          () => unauth.put("gb-20261113-140000-httpput02", { task: "nope" }),
+          (err: unknown) => {
+            assert.ok(err instanceof RelayError);
+            assert.match(err.message, /Failed to upload the task payload \(HTTP 401\)/);
+            assertNoSecret(err.message);
+            assert.ok(!err.message.includes(server.url));
+            return true;
+          },
+        );
+      } finally {
+        await server.close();
+      }
+    });
+  });
+
+  it("does not leak the results URL when a task upload cannot connect", async () => {
+    const url = "http://127.0.0.1:1/secret-results-path-should-not-leak";
+    const store = new HttpTaskStore(url, { Authorization: `Bearer ${TOKEN}` });
+    await assert.rejects(
+      () => store.put("gb-20261113-000000-aaaaaaaa", { task: "nope" }),
+      (err: unknown) => {
+        assert.ok(err instanceof RelayError);
+        assert.equal(err.message, "Failed to reach the results server.");
+        assert.ok(!err.message.includes("secret-results-path"));
+        assertNoSecret(err.message);
+        return true;
+      },
     );
-    assert.ok(!thrown.message.includes("http://example.invalid"));
+  });
+});
+
+describe("config for HTTP results", () => {
+  it("requires GROK_RELAY_RESULTS_TOKEN when a results URL or URL file is set", () => {
+    for (const extra of [
+      { GROK_RELAY_RESULTS_URL: "http://example.invalid/results-base" },
+      { GROK_RELAY_RESULTS_URL_FILE: "/tmp/does-not-need-to-exist-in-this-test" },
+    ]) {
+      let thrown: unknown;
+      try {
+        loadConfig({
+          GROK_WEBHOOK_URL: "http://example.invalid",
+          GROK_WEBHOOK_KEY: "TESTKEY_DO_NOT_PRINT_9f3a2c1b",
+          ...extra,
+        });
+      } catch (err) {
+        thrown = err;
+      }
+      assert.ok(thrown instanceof RelayError);
+      assert.equal(
+        thrown.message,
+        "Missing required environment variable: GROK_RELAY_RESULTS_TOKEN.",
+      );
+      assert.ok(!thrown.message.includes("http://example.invalid"));
+    }
   });
 });
 

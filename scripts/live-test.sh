@@ -18,6 +18,7 @@ if [[ ! -f dist/cli.js ]]; then
 fi
 
 export GROK_RELAY_RESULTS_DIR="${GROK_RELAY_RESULTS_DIR:-$ROOT/results}"
+export GROK_RELAY_TASKS_DIR="${GROK_RELAY_TASKS_DIR:-$ROOT/tasks}"
 
 echo "Posting a live test task and waiting up to 300s for a result..."
 echo "The Grok Bot routine must write \$GROK_RELAY_RESULTS_DIR/<request_id>.json when it finishes."

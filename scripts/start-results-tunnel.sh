@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start the read-only results server and a Cloudflare quick tunnel in front of it.
+# Start the results/task server and a Cloudflare quick tunnel in front of it.
+# Also starts the tunnel watchdog if it is not already running (detached).
 #
 # The public origin is written to "$GROK_RELAY_RUN_DIR/tunnel-url.txt"
 # (default: ./run/tunnel-url.txt). That directory is gitignored. This script
@@ -96,3 +97,10 @@ for _ in range(60):
 print("tunnel did not become ready; see run/tunnel.log", file=sys.stderr)
 sys.exit(1)
 PY
+
+# Start the watchdog detached so this script does not stay attached to it.
+if [[ -x "$ROOT/scripts/run-watchdog.sh" ]]; then
+  GROK_RELAY_ROOT="$ROOT" GROK_RELAY_RUN_DIR="$RUN" \
+    GROK_RELAY_RESTART_TUNNEL_CMD="$ROOT/scripts/start-results-tunnel.sh" \
+    bash "$ROOT/scripts/run-watchdog.sh" >/dev/null || true
+fi

@@ -19,7 +19,10 @@ URLs, logs, or result JSON. Keep examples as placeholders such as
 `https://example.invalid/...` and `YOUR_WEBHOOK_KEY`.
 
 The unit tests use a mock webhook and never call a real routine. Do not add
-live credentials to tests.
+live credentials to tests. Tests must be hermetic: use `isolatedEnv()` from
+`tests/test-env.ts` and never spread `process.env` into a child or `createRelay`
+call. Otherwise a developer’s `GROK_RELAY_RESULTS_URL` can make tests write
+into a live tasks folder or hit a real webhook.
 
 ## Style
 

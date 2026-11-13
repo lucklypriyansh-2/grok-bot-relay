@@ -5,15 +5,51 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultResultsDir } from "./config.js";
+import { defaultResultsDir, defaultTasksDir } from "./config.js";
 import { isValidRequestId } from "./ids.js";
+import { handleArtifactRoute } from "./artifacts.js";
 import { FileResultStore } from "./results.js";
+import { FileTaskStore, MAX_TASK_BYTES, parseTaskPayload, taskFilePath } from "./tasks.js";
 
 export const DEFAULT_RESULTS_PORT = 8787;
 export const DEFAULT_RESULTS_HOST = "127.0.0.1";
 export const DEFAULT_ENV_PATH = path.join(os.homedir(), ".config", "grok-relay", "env");
 
 const REQUEST_ID_IN_PATH = /^\/results\/([^/]+)$/;
+const TASK_ID_IN_PATH = /^\/tasks\/([^/]+)$/;
+
+class BodyLimitError extends Error {
+  constructor() {
+    super("payload too large");
+    this.name = "BodyLimitError";
+  }
+}
+
+async function readLimitedBody(
+  req: http.IncomingMessage,
+  maxBytes: number,
+): Promise<Buffer> {
+  const declared = req.headers["content-length"];
+  if (declared !== undefined) {
+    const n = Number(declared);
+    if (Number.isFinite(n) && n > maxBytes) {
+      req.resume();
+      throw new BodyLimitError();
+    }
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) {
+      req.resume();
+      throw new BodyLimitError();
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks, total);
+}
 
 /** SHA-256 then timing-safe compare, so unequal lengths cannot short-circuit. */
 export function tokensEqual(provided: string, expected: string): boolean {
@@ -44,6 +80,7 @@ function send(
 
 export type ResultsServerOptions = {
   resultsDir: string;
+  tasksDir: string;
   token: string;
   host?: string;
   port?: number;
@@ -63,6 +100,7 @@ export async function startResultsServer(
     throw new Error("Missing required environment variable: GROK_RELAY_RESULTS_TOKEN.");
   }
   const store = new FileResultStore(options.resultsDir);
+  const taskStore = new FileTaskStore(options.tasksDir);
   const host = options.host ?? DEFAULT_RESULTS_HOST;
   const port = options.port ?? DEFAULT_RESULTS_PORT;
 
@@ -82,6 +120,70 @@ export async function startResultsServer(
         send(res, 200, "ok\n");
         return;
       }
+
+      const taskMatch = TASK_ID_IN_PATH.exec(pathname);
+      if (method === "PUT" && taskMatch) {
+        const requestId = taskMatch[1];
+        if (!isValidRequestId(requestId)) {
+          req.resume();
+          send(res, 400, "invalid request_id\n");
+          return;
+        }
+        let raw: Buffer;
+        try {
+          raw = await readLimitedBody(req, MAX_TASK_BYTES);
+        } catch (err) {
+          if (err instanceof BodyLimitError) {
+            send(res, 413, "payload too large\n");
+            return;
+          }
+          throw err;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw.toString("utf8"));
+        } catch {
+          send(res, 400, "invalid json\n");
+          return;
+        }
+        let payload;
+        try {
+          payload = parseTaskPayload(parsed);
+        } catch {
+          send(res, 400, "invalid task\n");
+          return;
+        }
+        let existed = false;
+        try {
+          await fs.access(taskFilePath(options.tasksDir, requestId));
+          existed = true;
+        } catch {
+          existed = false;
+        }
+        try {
+          await taskStore.put(requestId, payload);
+        } catch (err) {
+          const code = (err as { code?: string }).code;
+          if (code === "task_exists") {
+            send(res, 409, "task exists\n");
+            return;
+          }
+          if (code === "task_too_large") {
+            send(res, 413, "payload too large\n");
+            return;
+          }
+          throw err;
+        }
+        if (existed) {
+          send(res, 200, "ok\n");
+        } else {
+          send(res, 201, "created\n");
+        }
+        return;
+      }
+
+      // Read-only artifact routes: GET /results/<id>/artifacts[/<name>]
+      if (await handleArtifactRoute(method, pathname, res, options.resultsDir)) return;
 
       const resultMatch = REQUEST_ID_IN_PATH.exec(pathname);
       if (method === "GET" && resultMatch) {
@@ -229,6 +331,7 @@ async function applyResultsEnv(envPath = DEFAULT_ENV_PATH): Promise<void> {
   for (const key of [
     "GROK_RELAY_RESULTS_TOKEN",
     "GROK_RELAY_RESULTS_DIR",
+    "GROK_RELAY_TASKS_DIR",
     "GROK_RELAY_RESULTS_HOST",
     "GROK_RELAY_RESULTS_PORT",
   ]) {
@@ -247,6 +350,7 @@ async function main() {
     process.exit(1);
   }
   const resultsDir = process.env.GROK_RELAY_RESULTS_DIR?.trim() || defaultResultsDir();
+  const tasksDir = process.env.GROK_RELAY_TASKS_DIR?.trim() || defaultTasksDir();
   const host = process.env.GROK_RELAY_RESULTS_HOST?.trim() || DEFAULT_RESULTS_HOST;
   const portRaw = process.env.GROK_RELAY_RESULTS_PORT?.trim();
   const port = portRaw ? Number(portRaw) : DEFAULT_RESULTS_PORT;
@@ -255,7 +359,7 @@ async function main() {
     process.exit(1);
   }
   try {
-    const started = await startResultsServer({ resultsDir, token, host, port });
+    const started = await startResultsServer({ resultsDir, tasksDir, token, host, port });
     process.stdout.write(`results server listening on ${started.host}:${started.port}\n`);
   } catch {
     process.stderr.write("results server failed to start.\n");

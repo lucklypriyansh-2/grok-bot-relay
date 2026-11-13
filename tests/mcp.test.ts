@@ -11,6 +11,7 @@ import {
   getDefaultEnvironment,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { startMockWebhook } from "./mock-webhook.ts";
+import { isolatedEnv, withoutGrokEnv } from "./test-env.ts";
 
 const SECRET = "TESTKEY_DO_NOT_PRINT_9f3a2c1b";
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -28,10 +29,10 @@ async function openSession(env: Record<string, string>): Promise<Session> {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
-    env: {
-      ...getDefaultEnvironment(),
+    env: isolatedEnv({
+      ...withoutGrokEnv(getDefaultEnvironment()),
       ...env,
-    },
+    }) as Record<string, string>,
     stderr: "pipe",
   });
   const err = transport.stderr;
@@ -76,10 +77,17 @@ describe("MCP stdio server", () => {
         GROK_WEBHOOK_URL: mock.url,
         GROK_WEBHOOK_KEY: SECRET,
         GROK_RELAY_RESULTS_DIR: dir,
+        GROK_RELAY_TASKS_DIR: path.join(dir, "tasks"),
       });
       const listed = await session.client.listTools();
       const names = listed.tools.map((t) => t.name).sort();
-      assert.deepEqual(names, ["ask_grok", "get_grok_result", "submit_grok_task"]);
+      assert.deepEqual(names, [
+        "ask_grok",
+        "download_grok_artifacts",
+        "get_grok_result",
+        "list_grok_artifacts",
+        "submit_grok_task",
+      ]);
 
       const asked = await session.client.callTool({
         name: "ask_grok",
@@ -114,6 +122,7 @@ describe("MCP stdio server", () => {
         GROK_WEBHOOK_URL: mock.url,
         GROK_WEBHOOK_KEY: SECRET,
         GROK_RELAY_RESULTS_DIR: dir,
+        GROK_RELAY_TASKS_DIR: path.join(dir, "tasks"),
       });
       const result = await session.client.callTool({
         name: "get_grok_result",
