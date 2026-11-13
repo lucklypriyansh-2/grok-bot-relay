@@ -1,4 +1,5 @@
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { RelayError } from "./errors.js";
@@ -13,6 +14,27 @@ export function defaultTasksDir(): string {
   return path.join(packageRoot, "tasks");
 }
 
+export const DEFAULT_INBOX_BASENAME = "grok-relay-inbox";
+export const DEFAULT_OUTBOX_BASENAME = "grok-relay-outbox";
+
+/**
+ * Resolve an optional directory setting.
+ * Unset or empty means off. The value "default" means ~/<basename>.
+ * A leading ~/ is expanded to the home directory.
+ */
+export function resolveOptionalDir(
+  value: string | undefined,
+  defaultBasename: string,
+): string | undefined {
+  const v = value?.trim();
+  if (!v) return undefined;
+  if (v === "default") return path.join(os.homedir(), defaultBasename);
+  if (v === "~") return os.homedir();
+  if (v.startsWith("~/")) return path.join(os.homedir(), v.slice(2));
+  return path.resolve(v);
+}
+
+
 const RESULTS_URL_PATTERN = /^https?:\/\/[^\s]+$/i;
 const MAX_URL_FILE_BYTES = 8 * 1024;
 
@@ -25,6 +47,10 @@ export type RelayConfig = {
   resultsUrlFile?: string;
   resultsToken?: string;
   getResultsUrl?: () => Promise<string>;
+  /** Local inbox the routine copies results into. Unset means off. */
+  inboxDir?: string;
+  /** Local outbox the client writes full tasks to. Unset means off. */
+  outboxDir?: string;
 };
 
 /**
@@ -124,6 +150,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
   const resultsUrlFile = env.GROK_RELAY_RESULTS_URL_FILE?.trim() || undefined;
   const resultsToken = env.GROK_RELAY_RESULTS_TOKEN?.trim() || undefined;
   const getResultsUrl = makeResultsUrlResolver(env);
+  const inboxDir = resolveOptionalDir(env.GROK_RELAY_INBOX_DIR, DEFAULT_INBOX_BASENAME);
+  const outboxDir = resolveOptionalDir(env.GROK_RELAY_OUTBOX_DIR, DEFAULT_OUTBOX_BASENAME);
 
   const missing: string[] = [];
   if (!webhookUrl) missing.push("GROK_WEBHOOK_URL");
@@ -145,5 +173,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RelayConfig {
     resultsUrlFile,
     resultsToken,
     getResultsUrl,
+    inboxDir,
+    outboxDir,
   };
 }

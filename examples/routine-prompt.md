@@ -99,3 +99,24 @@ node /ABSOLUTE/PATH/TO/grok-bot-relay/dist/cli.js complete \
 Files already in `$GROK_RELAY_RESULTS_DIR/<request_id>/` are included
 automatically. Keep secrets, tokens and webhook URLs out of both the answer
 and the artifact files.
+
+## Local inbox delivery (optional)
+
+If the client and the host do not share a filesystem, you can also deliver
+the finished result to a local inbox on the client machine (a folder the
+routine can write, for example through a shared or synced path).
+
+When you finish a request:
+
+1. Copy artifact files first to `<inbox_dir>/<request_id>/<name>`.
+2. Write the result JSON last, atomically (temp file, then rename), to
+   `<inbox_dir>/<request_id>.json`. The client treats that file as "done".
+
+If the host has no `tasks/<request_id>.json`, load the full task from the
+webhook pointer field `mac_task_path`, or from
+`<outbox_dir>/<request_id>.json` on the client machine.
+
+Do not hard-code a personal machine path in a published prompt. Configure
+the inbox and outbox directories in the client environment
+(`GROK_RELAY_INBOX_DIR` and `GROK_RELAY_OUTBOX_DIR`; the value `default`
+means `~/grok-relay-inbox` and `~/grok-relay-outbox`).

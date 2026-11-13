@@ -6,10 +6,11 @@ import path from "node:path";
 import {
   RelayError,
   isRetryableHttpStatus,
+  isTransientError,
   safeResultsNetworkError,
   transientHttpError,
 } from "./errors.js";
-import { withRetry } from "./retry.js";
+import { withRetry, type RetryOptions } from "./retry.js";
 import { assertValidRequestId, isValidRequestId } from "./ids.js";
 import type { ArtifactInfo, GrokResult, RelayOutcome } from "./types.js";
 
@@ -291,13 +292,16 @@ export class FileArtifactStore implements ArtifactStore {
 
 export class HttpArtifactStore implements ArtifactStore {
   private readonly resolveBaseUrl: () => Promise<string>;
+  private readonly retry: RetryOptions;
 
   constructor(
     baseUrl: string | (() => Promise<string>),
     private readonly headers: Record<string, string> = {},
+    retry: RetryOptions = {},
   ) {
     this.resolveBaseUrl =
       typeof baseUrl === "function" ? baseUrl : async () => baseUrl;
+    this.retry = retry;
   }
 
   private async base(requestId: string): Promise<string> {
@@ -324,7 +328,7 @@ export class HttpArtifactStore implements ArtifactStore {
         throw transientHttpError("results", res.status);
       }
       throw new RelayError(`Failed to fetch artifact (HTTP ${res.status}).`, "artifact_http_error");
-    });
+    }, this.retry);
   }
 
   async list(requestId: string): Promise<ArtifactInfo[]> {
@@ -369,19 +373,69 @@ export class HttpArtifactStore implements ArtifactStore {
   }
 }
 
+/**
+ * Prefer artifacts already in a local inbox and fall back to HTTP.
+ * list() includes a `path` for files that are already on disk.
+ */
+export class InboxFirstArtifactStore implements ArtifactStore {
+  constructor(
+    private readonly inboxDir: string,
+    private readonly inbox: FileArtifactStore,
+    private readonly remote?: ArtifactStore,
+  ) {}
+
+  async list(requestId: string): Promise<ArtifactInfo[]> {
+    const local = await this.inbox.list(requestId);
+    if (local.length > 0) {
+      return local.map((a) => ({
+        ...a,
+        path: a.path ?? artifactFilePath(this.inboxDir, requestId, a.name),
+      }));
+    }
+    if (!this.remote) return local;
+    try {
+      return await this.remote.list(requestId);
+    } catch (err) {
+      if (isTransientError(err)) return [];
+      throw err;
+    }
+  }
+
+  async fetch(requestId: string, name: string): Promise<Buffer> {
+    try {
+      return await this.inbox.fetch(requestId, name);
+    } catch (err) {
+      if (!(err instanceof RelayError) || err.code !== "artifact_not_found") throw err;
+    }
+    if (!this.remote) {
+      throw new RelayError(`Artifact not found: ${name}`, "artifact_not_found");
+    }
+    return this.remote.fetch(requestId, name);
+  }
+}
+
 export function createArtifactStore(options: {
   resultsDir: string;
   resultsUrl?: string;
   resultsToken?: string;
   getResultsUrl?: () => Promise<string>;
+  inboxDir?: string;
 }): ArtifactStore {
+  let remote: ArtifactStore | undefined;
   if (options.getResultsUrl || options.resultsUrl) {
     const headers: Record<string, string> = {};
     if (options.resultsToken) headers.Authorization = `Bearer ${options.resultsToken}`;
     const resolve = options.getResultsUrl ?? (async () => options.resultsUrl as string);
-    return new HttpArtifactStore(resolve, headers);
+    const retry: RetryOptions = options.inboxDir ? { maxAttempts: 1 } : {};
+    remote = new HttpArtifactStore(resolve, headers, retry);
   }
-  return new FileArtifactStore(options.resultsDir);
+  if (options.inboxDir) {
+    const inbox = new FileArtifactStore(options.inboxDir);
+    return remote
+      ? new InboxFirstArtifactStore(options.inboxDir, inbox, remote)
+      : new InboxFirstArtifactStore(options.inboxDir, inbox);
+  }
+  return remote ?? new FileArtifactStore(options.resultsDir);
 }
 
 export function parseArtifactList(data: unknown): ArtifactInfo[] {
@@ -422,6 +476,7 @@ export type DownloadedArtifact = {
   size: number;
   sha256: string;
   verified: boolean;
+  already_local?: boolean;
 };
 
 /**
@@ -445,9 +500,40 @@ export async function downloadArtifacts(
     }
     wanted = listing.filter((a) => options.names!.includes(a.name));
   }
-  await fs.mkdir(destDir, { recursive: true });
+  const explicitDest = Boolean(options.destDir?.trim());
   const files: DownloadedArtifact[] = [];
+  const needCopy = wanted.filter((art) => {
+    if (art.path && !explicitDest) return false;
+    if (art.path && explicitDest && path.resolve(art.path) === path.resolve(destDir, art.name)) return false;
+    return true;
+  });
+  if (needCopy.length > 0 || explicitDest) {
+    await fs.mkdir(destDir, { recursive: true });
+  }
   for (const art of wanted) {
+    const localPath = art.path && path.isAbsolute(art.path) ? art.path : undefined;
+    if (localPath && !explicitDest) {
+      let size = art.size ?? 0;
+      let sha = art.sha256 ?? "";
+      try {
+        const st = await fs.lstat(localPath);
+        if (st.isFile()) size = st.size;
+      } catch {
+        // fall through to fetch if the listed path is gone
+      }
+      if (!sha) {
+        try { sha = await sha256File(localPath); } catch { sha = ""; }
+      }
+      files.push({
+        name: art.name,
+        path: localPath,
+        size,
+        sha256: sha,
+        verified: Boolean(art.sha256),
+        already_local: true,
+      });
+      continue;
+    }
     const bytes = await store.fetch(requestId, art.name);
     const sha = createHash("sha256").update(bytes).digest("hex");
     if (art.sha256 && art.sha256 !== sha) {
@@ -465,7 +551,11 @@ export async function downloadArtifacts(
     }
     files.push({ name: art.name, path: dest, size: bytes.length, sha256: sha, verified: Boolean(art.sha256) });
   }
-  return { request_id: requestId, dest_dir: destDir, files };
+  const resolvedDest =
+    !explicitDest && files.length > 0 && files.every((f) => f.already_local)
+      ? path.dirname(files[0].path)
+      : destDir;
+  return { request_id: requestId, dest_dir: resolvedDest, files };
 }
 
 /**
@@ -499,10 +589,17 @@ export async function withArtifacts(
   };
   if (missing.length > 0) out.missing_artifacts = missing.map((m) => m.name);
   if (merged.length > 0) {
-    out.artifacts_hint =
-      `${merged.length} artifact file(s) attached. Call download_grok_artifacts ` +
-      `(CLI: grok-relay download ${result.request_id}) to save them to ` +
-      `~/grok-relay-artifacts/${result.request_id}/, then read the files for the full detail.`;
+    const local = merged.filter((a) => a.path);
+    if (local.length > 0) {
+      const listed = local.map((a) => `  ${a.name}  ${a.path}`).join("\n");
+      out.artifacts_hint =
+        `${local.length} artifact file(s) already on this machine (no download needed):\n${listed}`;
+    } else {
+      out.artifacts_hint =
+        `${merged.length} artifact file(s) attached. Call download_grok_artifacts ` +
+        `(CLI: grok-relay download ${result.request_id}) to save them to ` +
+        `~/grok-relay-artifacts/${result.request_id}/, then read the files for the full detail.`;
+    }
   }
   return out;
 }

@@ -7,6 +7,8 @@ export type ArtifactInfo = {
   sha256?: string;
   content_type?: string;
   description?: string;
+  /** Absolute local path when the file is already on this machine (inbox). */
+  path?: string;
 };
 
 export type GrokResult = {

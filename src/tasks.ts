@@ -7,7 +7,7 @@ import {
   safeResultsNetworkError,
   transientHttpError,
 } from "./errors.js";
-import { withRetry } from "./retry.js";
+import { withRetry, type RetryOptions } from "./retry.js";
 import { assertValidRequestId } from "./ids.js";
 
 export const MAX_TASK_BYTES = 256 * 1024;
@@ -131,15 +131,25 @@ export class FileTaskStore implements TaskStore {
   }
 }
 
+export type HttpTaskStoreOptions = {
+  retry?: RetryOptions;
+  timeoutMs?: number;
+};
+
 export class HttpTaskStore implements TaskStore {
   private readonly resolveBaseUrl: () => Promise<string>;
+  private readonly retry: RetryOptions;
+  private readonly timeoutMs: number;
 
   constructor(
     baseUrl: string | (() => Promise<string>),
     private readonly headers: Record<string, string> = {},
+    options: HttpTaskStoreOptions = {},
   ) {
     this.resolveBaseUrl =
       typeof baseUrl === "function" ? baseUrl : async () => baseUrl;
+    this.retry = options.retry ?? {};
+    this.timeoutMs = options.timeoutMs ?? PUT_TIMEOUT_MS;
   }
 
   private async urlFor(requestId: string): Promise<string> {
@@ -153,7 +163,7 @@ export class HttpTaskStore implements TaskStore {
     assertTaskSize(parsed);
     await withRetry(async () => {
       const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), PUT_TIMEOUT_MS);
+      const timer = setTimeout(() => ac.abort(), this.timeoutMs);
       let res: Response;
       try {
         res = await fetch(await this.urlFor(requestId), {
@@ -206,6 +216,8 @@ export function createTaskStore(options: {
   resultsUrl?: string;
   resultsToken?: string;
   getResultsUrl?: () => Promise<string>;
+  retry?: RetryOptions;
+  timeoutMs?: number;
 }): TaskStore {
   if (options.getResultsUrl || options.resultsUrl) {
     const headers: Record<string, string> = {};
@@ -213,7 +225,10 @@ export function createTaskStore(options: {
       headers.Authorization = `Bearer ${options.resultsToken}`;
     }
     const resolve = options.getResultsUrl ?? (async () => options.resultsUrl as string);
-    return new HttpTaskStore(resolve, headers);
+    return new HttpTaskStore(resolve, headers, {
+      retry: options.retry,
+      timeoutMs: options.timeoutMs,
+    });
   }
   return new FileTaskStore(options.tasksDir);
 }

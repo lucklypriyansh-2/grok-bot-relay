@@ -12,6 +12,8 @@ export type WebhookPointerPayload = {
   request_id: string;
   task_ref: string;
   task_preview: string;
+  /** Absolute path of the full task on the client machine (outbox). */
+  mac_task_path?: string;
 };
 
 export function taskRefFor(requestId: string): string {
@@ -20,11 +22,13 @@ export function taskRefFor(requestId: string): string {
 
 export function serializeWebhookPointer(payload: WebhookPointerPayload): string {
   // Key order matters: request_id must be first so a truncated wake still has the id.
-  return JSON.stringify({
+  const body: Record<string, string> = {
     request_id: payload.request_id,
     task_ref: payload.task_ref,
-    task_preview: payload.task_preview,
-  });
+  };
+  if (payload.mac_task_path) body.mac_task_path = payload.mac_task_path;
+  body.task_preview = payload.task_preview;
+  return JSON.stringify(body);
 }
 
 /**
@@ -32,22 +36,25 @@ export function serializeWebhookPointer(payload: WebhookPointerPayload): string 
  * task_preview is the first TASK_PREVIEW_CHARS of the task, shortened further
  * if JSON escaping would push the body over the cap.
  */
-export function buildWebhookPointer(requestId: string, task: string): WebhookPointerPayload {
+export function buildWebhookPointer(
+  requestId: string,
+  task: string,
+  options: { macTaskPath?: string } = {},
+): WebhookPointerPayload {
   assertValidRequestId(requestId);
+  const macTaskPath = options.macTaskPath?.trim() || undefined;
   let preview = task.slice(0, TASK_PREVIEW_CHARS);
-  let payload: WebhookPointerPayload = {
+  const make = (task_preview: string): WebhookPointerPayload => ({
     request_id: requestId,
     task_ref: taskRefFor(requestId),
-    task_preview: preview,
-  };
+    task_preview,
+    ...(macTaskPath ? { mac_task_path: macTaskPath } : {}),
+  });
+  let payload = make(preview);
   while (serializeWebhookPointer(payload).length > MAX_WEBHOOK_BODY_CHARS && preview.length > 0) {
     const over = serializeWebhookPointer(payload).length - MAX_WEBHOOK_BODY_CHARS;
     preview = preview.slice(0, Math.max(0, preview.length - Math.max(over, 1)));
-    payload = {
-      request_id: requestId,
-      task_ref: taskRefFor(requestId),
-      task_preview: preview,
-    };
+    payload = make(preview);
   }
   const body = serializeWebhookPointer(payload);
   if (body.length > MAX_WEBHOOK_BODY_CHARS) {

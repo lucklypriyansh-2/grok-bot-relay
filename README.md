@@ -225,7 +225,7 @@ A quick-tunnel URL changes whenever the tunnel restarts. For a stable address, u
 
 ## Long tasks
 
-The routine webhook body is a small pointer (`request_id` first, then `task_ref` and `task_preview`, at most about 600 characters). The full `{task, context?, bot?}` payload is written to `tasks/<request_id>.json` first (locally, or with `PUT /tasks/<request_id>`). The routine must read that file. This avoids a payload size limit that can truncate a long JSON body mid-sentence and drop `request_id`.
+The routine webhook body is a small pointer (`request_id` first, then `task_ref`, optional `mac_task_path`, and `task_preview`, at most about 600 characters). The full `{task, context?, bot?}` payload is written first: to a local outbox when `GROK_RELAY_OUTBOX_DIR` is set, and/or with `PUT /tasks/<request_id>` (or a local `tasks/` folder). The routine must read that file (or `mac_task_path` if the host copy is missing). This avoids a payload size limit that can truncate a long JSON body mid-sentence and drop `request_id`.
 
 Older clients that still post a full task in the webhook body can be supported by a routine prompt that falls back to the body when the task file is missing. See [`examples/routine-prompt.md`](examples/routine-prompt.md).
 
@@ -247,6 +247,42 @@ The result JSON should stay short. For long research, the routine writes files i
 ```
 
 Artifact names are a single path segment of letters, digits, `.`, `_`, and `-`, up to 128 characters, and must not start with a dot. The results server serves them at `GET /results/<id>/artifacts` and `GET /results/<id>/artifacts/<name>` (token required, read-only). The CLI and MCP tools can list and download them, verifying sha256 when it is present. `grok-relay complete --artifact PATH` copies files into place, fills size and sha256, and writes the result JSON last.
+
+
+## Local inbox mode (no tunnel)
+
+A Cloudflare tunnel is optional in both directions if the routine can write
+to a folder on the client machine (a shared disk, a sync tool, or any path
+the host can reach).
+
+On the client:
+
+```bash
+export GROK_RELAY_INBOX_DIR="default"    # ~/grok-relay-inbox
+export GROK_RELAY_OUTBOX_DIR="default"   # ~/grok-relay-outbox
+```
+
+Unset either variable to turn that side off. Any other value is a path
+(`~/` is expanded).
+
+**Outbox (client → host).** Before the webhook is posted, the client writes
+the full `{task, context?, bot?}` payload atomically to
+`<outbox>/<request_id>.json` and includes that absolute path as
+`mac_task_path` in the webhook pointer. It still tries `PUT /tasks` through
+the results URL when one is configured. If that upload fails but the outbox
+write succeeded, the webhook is sent anyway — the tunnel is not a hard
+dependency. A conflicting payload (`409`) is still an error.
+
+**Inbox (host → client).** When the routine finishes, it should copy
+artifact files to `<inbox>/<request_id>/<name>` first, then write the result
+JSON last to `<inbox>/<request_id>.json`. `get_grok_result`, `ask_grok`
+polling, and artifact list/download check the inbox first and fall back to
+the HTTP results URL. Artifacts already in the inbox are returned as local
+paths; no download is required.
+
+The routine webhook itself still has to be reachable (that is separate from
+the results tunnel). You can keep `GROK_RELAY_RESULTS_URL` as a fallback, or
+omit it and use only the inbox and outbox.
 
 ## Resilience
 
@@ -271,6 +307,7 @@ For a **stable** origin that never needs discovery, use a [named Cloudflare tunn
 | HTTP 502/503/504 | Temporary proxy or origin issue. | The client retries these. If they persist, check that the results server is listening and the tunnel is up. |
 | `ask_grok` returns `pending` | The wait expired, or the results server was unreachable for the whole wait. | Call `get_grok_result` with the `request_id`. The routine may still be running. |
 | Tests write files into a live `tasks/` folder, or fail with 530 | Tests inherited `GROK_RELAY_RESULTS_URL` from the real environment. | Upgrade to 1.1.0+; tests use `isolatedEnv()` and must not spread `process.env`. |
+| Tunnel down, but inbox/outbox are configured | HTTP `PUT`/`GET` fail; the local folders still work. | Leave `GROK_RELAY_INBOX_DIR` and `GROK_RELAY_OUTBOX_DIR` set. `ask_grok` will still post the webhook and poll the inbox. Check that the routine is writing `<inbox>/<id>.json` last. |
 
 ## Live end-to-end test
 
@@ -297,7 +334,7 @@ The routine must write the result file or the command will exit with status 2 an
 
 - Each webhook call starts a Grok Bot run and **counts toward your usage**.
 - Routine webhook triggers are rate-limited (on the order of **300 runs per hour** in total, and 200 per routine). Check the current [docs](https://docs.x.ai/grok-bot/skills-routines-and-automations) for the latest numbers.
-- The webhook body is a small pointer (about 600 characters, `request_id` first). The full task is uploaded first; if that upload fails, the webhook is not called.
+- The webhook body is a small pointer (about 600 characters, `request_id` first). The full task is written first (outbox and/or `PUT /tasks`). If the HTTP upload fails but a local outbox write succeeded, the webhook is still sent. If there is no successful outbox or upload, the webhook is not called.
 - A `200` from the webhook only means the run started.
 - Maximum wait is 780 seconds. After that, collect the answer with `get_grok_result` or `grok-relay get --wait`.
 - A Cloudflare quick-tunnel URL changes whenever the tunnel is restarted. Point `GROK_RELAY_RESULTS_URL_FILE` at a synced `tunnel-url.txt`, or use a named tunnel / Tailscale for a stable address.

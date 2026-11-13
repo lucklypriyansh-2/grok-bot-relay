@@ -20,7 +20,7 @@ import {
 
 const server = new McpServer({
   name: "grok-bot-relay",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 function toolText(payload: unknown, isError = false) {
@@ -49,6 +49,7 @@ function artifactStore() {
     resultsUrl: config.resultsUrl,
     resultsToken: config.resultsToken,
     getResultsUrl: config.getResultsUrl,
+    inboxDir: config.inboxDir,
   });
 }
 

@@ -5,10 +5,11 @@ import { parseArtifactList } from "./artifacts.js";
 import {
   RelayError,
   isRetryableHttpStatus,
+  isTransientError,
   safeResultsNetworkError,
   transientHttpError,
 } from "./errors.js";
-import { withRetry } from "./retry.js";
+import { withRetry, type RetryOptions } from "./retry.js";
 import { assertValidRequestId } from "./ids.js";
 import { RESULT_STATUSES, type GrokResult, type ResultStatus } from "./types.js";
 
@@ -111,13 +112,16 @@ export class FileResultStore implements ResultStore {
  */
 export class HttpResultStore implements ResultStore {
   private readonly resolveBaseUrl: () => Promise<string>;
+  private readonly retry: RetryOptions;
 
   constructor(
     baseUrl: string | (() => Promise<string>),
     private readonly headers: Record<string, string> = {},
+    retry: RetryOptions = {},
   ) {
     this.resolveBaseUrl =
       typeof baseUrl === "function" ? baseUrl : async () => baseUrl;
+    this.retry = retry;
   }
 
   private async urlFor(requestId: string): Promise<string> {
@@ -156,7 +160,7 @@ export class HttpResultStore implements ResultStore {
         throw transientHttpError("results", res.status);
       }
       throw new RelayError(`Failed to read result (HTTP ${res.status}).`, "result_http_error");
-    });
+    }, this.retry);
   }
 
   async writeAtomic(result: GrokResult): Promise<void> {
@@ -186,7 +190,36 @@ export class HttpResultStore implements ResultStore {
         throw transientHttpError("results", res.status);
       }
       throw new RelayError(`Failed to write result (HTTP ${res.status}).`, "result_http_error");
-    });
+    }, this.retry);
+  }
+}
+
+/**
+ * Prefer a local inbox (the routine copies results here) and fall back to HTTP.
+ * Transient remote errors are treated as "not ready yet" so polling stays snappy
+ * when the tunnel is down.
+ */
+export class InboxFirstResultStore implements ResultStore {
+  constructor(
+    private readonly inbox: FileResultStore,
+    private readonly remote?: ResultStore,
+  ) {}
+
+  async read(requestId: string): Promise<GrokResult | null> {
+    const local = await this.inbox.read(requestId);
+    if (local) return local;
+    if (!this.remote) return null;
+    try {
+      return await this.remote.read(requestId);
+    } catch (err) {
+      if (isTransientError(err)) return null;
+      throw err;
+    }
+  }
+
+  writeAtomic(result: GrokResult): Promise<void> {
+    if (this.remote) return this.remote.writeAtomic(result);
+    return this.inbox.writeAtomic(result);
   }
 }
 
@@ -195,14 +228,22 @@ export function createResultStore(options: {
   resultsUrl?: string;
   resultsToken?: string;
   getResultsUrl?: () => Promise<string>;
+  inboxDir?: string;
 }): ResultStore {
+  let remote: ResultStore | undefined;
   if (options.getResultsUrl || options.resultsUrl) {
     const headers: Record<string, string> = {};
     if (options.resultsToken) {
       headers.Authorization = `Bearer ${options.resultsToken}`;
     }
     const resolve = options.getResultsUrl ?? (async () => options.resultsUrl as string);
-    return new HttpResultStore(resolve, headers);
+    // When an inbox is the primary path, do not burn the poll interval on HTTP retries.
+    const retry: RetryOptions = options.inboxDir ? { maxAttempts: 1 } : {};
+    remote = new HttpResultStore(resolve, headers, retry);
   }
-  return new FileResultStore(options.resultsDir);
+  if (options.inboxDir) {
+    const inbox = new FileResultStore(options.inboxDir);
+    return remote ? new InboxFirstResultStore(inbox, remote) : inbox;
+  }
+  return remote ?? new FileResultStore(options.resultsDir);
 }

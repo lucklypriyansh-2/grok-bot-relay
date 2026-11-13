@@ -6,7 +6,12 @@ import {
   listArtifactsOnDisk,
   withArtifacts,
 } from "./artifacts.js";
-import { defaultResultsDir } from "./config.js";
+import {
+  DEFAULT_INBOX_BASENAME,
+  defaultResultsDir,
+  makeResultsUrlResolver,
+  resolveOptionalDir,
+} from "./config.js";
 import { RelayError, redact } from "./errors.js";
 import {
   askGrok,
@@ -40,6 +45,8 @@ Environment:
   GROK_RELAY_RESULTS_URL       Optional HTTP base URL for results and task upload
   GROK_RELAY_RESULTS_URL_FILE  Optional file with the results origin (re-read on each request)
   GROK_RELAY_RESULTS_TOKEN     Bearer token for the HTTP result store
+  GROK_RELAY_INBOX_DIR         Optional local inbox (set to "default" for ~/grok-relay-inbox)
+  GROK_RELAY_OUTBOX_DIR        Optional local outbox (set to "default" for ~/grok-relay-outbox)
 `;
 
 type Flags = {
@@ -104,18 +111,30 @@ function secrets(): Array<string | undefined> {
 }
 
 function cliArtifactStore() {
+  // Artifacts / download should work with only an inbox or results dir;
+  // they must not require the webhook variables that ask/submit need.
+  const resultsDir = process.env.GROK_RELAY_RESULTS_DIR?.trim() || defaultResultsDir();
+  const resultsUrl = process.env.GROK_RELAY_RESULTS_URL?.trim().replace(/\/+$/, "") || undefined;
+  const resultsToken = process.env.GROK_RELAY_RESULTS_TOKEN?.trim() || undefined;
   return createArtifactStore({
-    resultsDir: process.env.GROK_RELAY_RESULTS_DIR?.trim() || defaultResultsDir(),
-    resultsUrl: process.env.GROK_RELAY_RESULTS_URL?.trim() || undefined,
-    resultsToken: process.env.GROK_RELAY_RESULTS_TOKEN?.trim() || undefined,
+    resultsDir,
+    resultsUrl,
+    resultsToken,
+    getResultsUrl: makeResultsUrlResolver(process.env),
+    inboxDir: resolveOptionalDir(process.env.GROK_RELAY_INBOX_DIR, DEFAULT_INBOX_BASENAME),
   });
 }
 
-function printArtifactsHint(outcome: { artifacts?: { name: string; size?: number }[]; artifacts_hint?: string }) {
+function printArtifactsHint(outcome: { artifacts?: { name: string; size?: number; path?: string }[]; artifacts_hint?: string }) {
   if (!outcome.artifacts || outcome.artifacts.length === 0) return;
   process.stdout.write("\nArtifacts:\n");
   for (const a of outcome.artifacts) {
-    process.stdout.write(`  ${a.name}${a.size !== undefined ? ` (${a.size} bytes)` : ""}\n`);
+    const extra = a.path
+      ? `  ${a.path}`
+      : a.size !== undefined
+        ? ` (${a.size} bytes)`
+        : "";
+    process.stdout.write(`  ${a.name}${extra}\n`);
   }
   if (outcome.artifacts_hint) process.stdout.write(outcome.artifacts_hint + "\n");
 }
