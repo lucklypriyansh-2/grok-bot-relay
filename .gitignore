@@ -1,0 +1,12 @@
+node_modules/
+dist/
+results/*
+!results/.gitkeep
+.env
+.env.*
+*.log
+run/
+*.tgz
+*.tar.gz
+*.tar
+.DS_Store

@@ -1,0 +1,47 @@
+{
+  "name": "grok-bot-relay",
+  "version": "1.0.0",
+  "description": "Tiny MCP server and CLI that sends a task to a Grok Bot routine webhook and collects the answer.",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "grok-relay": "dist/cli.js",
+    "grok-bot-relay": "dist/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "relay": "node dist/cli.js",
+    "serve-results": "node dist/results-server.js",
+    "test": "tsc && tsx --test --test-timeout=60000 tests/*.test.ts",
+    "live-test": "bash scripts/live-test.sh",
+    "start-tunnel": "bash scripts/start-results-tunnel.sh"
+  },
+  "keywords": [
+    "mcp",
+    "grok",
+    "cli",
+    "webhook",
+    "relay"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ]
+}
